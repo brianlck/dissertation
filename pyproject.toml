@@ -1,0 +1,15 @@
+[tool.poetry]
+name = "mcmd"
+version = "0.1.0"
+description = ""
+authors = ["brianlck <brianlee.lck@gmail.com>"]
+readme = "README.md"
+
+[tool.poetry.dependencies]
+python = "^3.8"
+torch = {version = "^2.1.0", python = "^3.9", platform = "linux"}
+
+
+[build-system]
+requires = ["poetry-core"]
+build-backend = "poetry.core.masonry.api"
