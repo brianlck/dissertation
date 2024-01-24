@@ -1,32 +1,23 @@
 import datetime
 import logging
-from mcmd.initial_dist import prepare_init_dist
-from mcmd.loss_fn import LossFunction, ReverseKL, prepare_loss_fn
-from mcmd.sampler import CMCD, Sampler
-from mcmd.score import prepare_score_fn
-from mcmd.densities import (
-    prepare_target,
-)
-from mcmd.anneal import GeometricAnnealing, prepare_anneal
+from cmcd.initial_dist import prepare_init_dist
+from cmcd.loss_fn import prepare_loss_fn
+from cmcd.sampler import CMCD
+from cmcd.score import prepare_score_fn
+from cmcd.densities import prepare_target
+from cmcd.anneal import prepare_anneal
 
 import torch
 import click
 from pathlib import Path
 import random
 import numpy as np
-
-from rich.progress import (
-    Progress,
-    TextColumn,
-    BarColumn,
-    SpinnerColumn,
-    TimeRemainingColumn,
-)
 import yaml
 import wandb
 
-torch.set_default_device("cuda")
+from train import train
 
+# torch._dynamo.config.cache_size_limit = 256
 
 def setup(config: dict):
     score_fn = prepare_score_fn(config)
@@ -44,169 +35,16 @@ def setup(config: dict):
         config["eps_trainable"],
     )
 
-    optim = torch.optim.Adam(sampler.parameters(), lr=config["lr"])
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(optim, T_0=1000)
+    params = list(filter(lambda kv: kv[0] != "ln_z", sampler.named_parameters()))
+    params = [x[1] for x in params]
+
+    optim = torch.optim.Adam(
+        [{"params": params, "lr": config['lr']}, {"params": sampler.ln_z, "lr": 0.1}],
+        lr=config["lr"],
+    )
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optim, T_max=config['max_epoch'])
 
     return sampler, optim, scheduler, loss_fn
-
-
-def grad_norm(model):
-    total_norm = 0
-    for p in model.parameters():
-        if p.grad is not None and torch.is_tensor(p.grad.data):
-            param_norm = p.grad.data.norm(2)
-            total_norm += param_norm.item() ** 2
-    total_norm = total_norm ** (1.0 / 2)
-    return total_norm
-
-
-
-def train(
-    max_epoch: int,
-    config: dict,
-    batch_size: int,
-    sampler: Sampler,
-    optim: torch.optim.Optimizer,
-    scheduler: torch.optim.lr_scheduler.LRScheduler,
-    loss_fn: LossFunction,
-    log_directory: Path,
-):
-    all_losses = []
-
-    try:
-        with Progress(
-            TextColumn("{task.completed} of {task.total}"),
-            BarColumn(),
-            SpinnerColumn(),
-            TextColumn("Loss: {task.fields[loss]};"),
-            TextColumn("elbo: {task.fields[elbo]};"),
-            TextColumn("ln z: {task.fields[ln_z]};"),
-            TextColumn("eps: {task.fields[eps]};"),
-            TextColumn("vi: {task.fields[vi]};"),
-            TimeRemainingColumn(),
-        ) as progress:
-            task = progress.add_task(
-                "Training...",
-                total=max_epoch,
-                elbo=None,
-                ln_z=None,
-                loss=None,
-                eps=None,
-                grid_t_min=None,
-                vi=None,
-            )
-
-            for epoch in range(max_epoch):
-                optim.zero_grad()
-
-                repel = config["repel"] and (
-                    config["pretrain_epoch"] == None or epoch < config["pretrain_epoch"]
-                )
-
-                samples = sampler.sample(batch_size, repel=repel, repel_percentage=config['repel_percentage'])
-
-                loss = loss_fn.evaluate(samples)
-                loss.backward()
-
-                optim.step()
-                scheduler.step()
-
-                loss = loss.detach().item()
-                all_losses.append(loss)
-
-                ln_z = samples.ln_z.detach().item()
-                elbo = samples.elbo.detach().item()
-                eps = sampler.eps.item()
-
-                wandb.log(
-                    dict(
-                        loss=loss,
-                        ln_z=ln_z,
-                        elbo=elbo,
-                        eps=eps,
-                        beta_min=sampler.betas().min().detach().item(),
-                        beta_max=sampler.betas().max().detach().item(),
-                        betas=sampler.betas().tolist(),
-                        grad_norm=grad_norm(sampler),
-                        grid_t_min=sampler.grid_t.min().detach().item(),
-                        grid_t_max=sampler.grid_t.max().detach().item(),
-                    )
-                )
-
-                progress.update(
-                    task,
-                    advance=1,
-                    loss=loss,
-                    ln_z=ln_z,
-                    elbo=elbo,
-                    vi=sampler.initial_dist.scale.mean().detach().item(),
-                    eps=eps,
-                )
-
-                if epoch % 1000 == 0:
-                    progress_dict = dict(
-                        epoch=epoch,
-                        samples=samples,
-                        all_losses=all_losses,
-                        sampler=sampler.state_dict(),
-                        optim=optim.state_dict(),
-                        scheduler=scheduler.state_dict(),
-                        eval_loss=[],
-                        elbo=[],
-                        ln_z=[],
-                    )
-                    torch.save(progress_dict, log_directory / f"progress_{epoch}.pth")
-
-    except KeyboardInterrupt:
-        pass
-
-    progress_dict = dict(
-        all_losses=all_losses,
-        sampler=sampler.state_dict(),
-        optim=optim.state_dict(),
-        scheduler=scheduler.state_dict(),
-        eval_loss=[],
-        elbo=[],
-        ln_z=[],
-    )
-
-    truth = sampler.target.log_norm()
-    kl = ReverseKL()
-    with torch.no_grad():
-        for i in range(30):
-            samples = sampler.sample(2000, repel=False, repel_percentage=0.0)
-            loss = loss_fn.evaluate(samples)
-            progress_dict["eval_loss"].append(loss.detach().item()) # type: ignore
-            progress_dict["ln_z"].append(samples.ln_z.detach().item()) # type: ignore
-            progress_dict["ln_z_bias"].append( # type: ignore
-                (samples.ln_z.detach() - truth).abs().item()
-            )
-            progress_dict["elbo"].append(samples.elbo.detach().item()) # type: ignore
-            progress_dict["ess"].append(samples.ess()) # type: ignore
-
-        print("Evaluation Loss", progress_dict["eval_loss"])
-        print("ln z", progress_dict["ln_z"])
-        print("elbo", progress_dict["elbo"])
-
-        wandb.summary["final_loss"] = progress_dict["eval_loss"]
-        wandb.summary["final_loss_std"] = torch.tensor(progress_dict["eval_loss"]).std()
-        wandb.summary["final_loss_mean"] = torch.tensor(progress_dict["eval_loss"]).mean()
-
-        wandb.summary["ln_z"] = progress_dict["ln_z"]
-        wandb.summary["ln_z_std"] = torch.tensor(progress_dict["ln_z"]).std()
-        wandb.summary["ln_z_mean"] = torch.tensor(progress_dict["ln_z"]).mean()
-
-        wandb.summary["elbo"] = progress_dict["elbo"]
-        wandb.summary["elbo_std"] = torch.tensor(progress_dict["elbo"]).std()
-        wandb.summary["elbo_mean"] = torch.tensor(progress_dict["elbo"]).mean()
-
-        wandb.summary["ess"] = progress_dict["ess"]
-        wandb.summary["ess"] = torch.tensor(progress_dict["ess"]).std()
-        wandb.summary["ess"] = torch.tensor(progress_dict["ess"]).mean()
-
-        wandb.finish()
-
-        torch.save(progress_dict, log_directory / "progress.pth")
 
 
 @click.command()
@@ -229,9 +67,10 @@ def train(
 @click.option("--dw_d", type=int)
 @click.option("--dw_m", type=int)
 @click.option("--dw_delta", type=int)
-@click.option("--a", type=float)
+@click.option("--repel_percentage", type=float)
 @click.option("--progress", type=int)
 @click.option("--pretrain-epoch", type=int)
+@click.option("--use_buffer", type=bool)
 def main(
     x_dim: int,
     t_dim: int,
@@ -252,10 +91,13 @@ def main(
     dw_d: int,
     dw_m: int,
     dw_delta: int,
-    a: float,
+    repel_percentage: float,
     progress: int,
     pretrain_epoch: int,
+    use_buffer: bool,
 ):
+    torch.set_default_device("cuda")
+
     torch.manual_seed(seed)
     random.seed(seed)
     np.random.seed(seed)
@@ -283,13 +125,14 @@ def main(
         dw_d=dw_d,
         dw_m=dw_m,
         dw_delta=dw_delta,
-        a=a,
+        repel_percentage=repel_percentage,
         pretrain_epoch=pretrain_epoch,
+        use_buffer=use_buffer
     )
 
     wandb.init(project="dissertation", config=config, entity="brianlee-lck")
-    wandb.run.log_code(".") # type: ignore
-    
+    wandb.run.log_code(".")  # type: ignore
+
     # store h_params
     with open(log_directory / "hparam.yaml", "w") as file:
         yaml.dump(config, file)
@@ -304,14 +147,23 @@ def main(
         progress_path = f"{progress_path}.pth"
 
         checkpoint = torch.load(progress_path)
-        sampler.load_state_dict(checkpoint["sampler"]) 
+        sampler.load_state_dict(checkpoint["sampler"])
         optim.load_state_dict(checkpoint["optim"])
         if scheduler in checkpoint:
             scheduler.load_state_dict(checkpoint["scheduler"])
         else:
             logging.warning("checkpoint does not have scheduler")
 
-    train(max_epoch, config, batch_size, sampler, optim, scheduler, loss_fn_cls, log_directory)
+    train(
+        max_epoch,
+        config,
+        batch_size,
+        sampler,
+        optim,
+        scheduler,
+        loss_fn_cls,
+        log_directory,
+    )
 
 
 if __name__ == "__main__":

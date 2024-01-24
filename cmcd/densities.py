@@ -3,7 +3,7 @@ from statistics import covariance
 import torch
 import torch.nn as nn
 import numpy as np
-from mcmd.numericals import  quadratic_function, importance_weighted_expectation, effective_sample_size_over_p, MC_estimate_true_expectation
+from cmcd.numericals import  quadratic_function, importance_weighted_expectation, effective_sample_size_over_p, MC_estimate_true_expectation
 
 Tensor = torch.Tensor
 
@@ -102,7 +102,7 @@ class GaussianMixture(LogDensity):
 
         return torch.concatenate([logp1, logp2]).logsumexp(dim=0)
 
-    def log_norm(self, x):
+    def log_norm(self):
         return 0.
 
 
@@ -226,6 +226,9 @@ class GMM(nn.Module, LogDensity):
             summary_dict = {"bias_normed": bias_normed.cpu().item(),
                             "bias_no_correction": torch.abs(bias_no_correction).cpu().item()}
         return summary_dict
+    
+    def log_norm(self):
+        return 0.0
     
 
 def prepare_target(config):

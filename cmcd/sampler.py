@@ -3,10 +3,10 @@ from dataclasses import dataclass
 import torch
 import torch.nn as nn
 from torch.distributions import Normal
-from mcmd.anneal import AnnealingSchedule
-from mcmd.densities import  log_normal
-from mcmd.samples import Samples
-from mcmd.score import ScoreNetwork
+from cmcd.anneal import AnnealingSchedule
+from cmcd.densities import  log_normal
+from cmcd.samples import Samples
+from cmcd.score import FourierMLP
 
 Tensor = torch.Tensor
 
@@ -19,12 +19,20 @@ class Sampler(nn.Module, ABC):
         self.target_density = target_density
 
     @abstractmethod
-    def evolve(self, particles: Tensor) -> Samples:
-        pass
+    def evolve(self, particles: Tensor) -> Tensor:
+        raise NotImplementedError
 
-    def sample(self, batch, **kwargs):
+    @abstractmethod
+    def evaluate(self, paths: Tensor) -> Samples:
+        raise NotImplementedError
+
+    def sample(self, batch, **kwargs) -> Tensor:
         particles = self.initial_dist.sample(batch)
         return self.evolve(particles, **kwargs)
+    
+    @abstractmethod
+    def sample_and_evaluate(self, batch) -> Samples:
+        raise NotImplementedError
 
 
 class CMCD(Sampler, nn.Module):
@@ -33,7 +41,7 @@ class CMCD(Sampler, nn.Module):
         initial_dist,
         target_density,
         anneal_schedule: AnnealingSchedule,
-        score_network: ScoreNetwork,
+        score_network: FourierMLP,
         n_bridges: int,
         initial_eps: float,
         eps_trainable: bool = False,
@@ -53,6 +61,7 @@ class CMCD(Sampler, nn.Module):
             self.register_buffer("eps", eps)
 
         self.grid_t = nn.Parameter(torch.zeros(n_bridges))
+        self.ln_z = nn.Parameter(torch.tensor(0.0))
 
         noise_loc = torch.tensor(0.0)
         noise_scale = torch.tensor(1.0)
@@ -70,7 +79,7 @@ class CMCD(Sampler, nn.Module):
         h_t = distance_m.flatten().median() ** 2 / torch.tensor(batch).log()
         d = (-(distance_m**2 / h_t)).exp()
         f = repel_x[:, None] - repel_x[None, :]
-        force = -(d[:, :, None] * f).sum(1) / h_t
+        force = -0.1 * (d[:, :, None] * f).sum(1) / h_t
 
         return torch.nn.functional.pad(
             force, (0, 0, 0, x.shape[0] - batch), "constant", 0
@@ -85,7 +94,7 @@ class CMCD(Sampler, nn.Module):
 
     def drift(self, particles, i, stable=False):
         return (
-            self.grad_log_phi_(particles, self.betas()[i], stable)
+            self.grad_log_pi_(particles, self.betas()[i], stable)
             - self.score_fn(particles, i)
         ) * self.eps
 
@@ -93,7 +102,7 @@ class CMCD(Sampler, nn.Module):
         size = torch.Size((self.n_bridges, B, N))
         return self.noise_dist.sample(size)
 
-    def log_phi(self, x, t):
+    def log_pi(self, x, t):
         log_initial = self.initial_dist.log_prob(x)
         log_target = self.target_density.log_density(x)
 
@@ -119,7 +128,7 @@ class CMCD(Sampler, nn.Module):
     def log_target_density(self, x):
         return self.target_density.log_density(x)
 
-    grad_log_phi = get_grad(log_phi)  # type: ignore
+    grad_log_pi = get_grad(log_pi)  # type: ignore
     grad_target_log = get_grad2(log_target_density) # type: ignore
     grad_initial_log = get_grad2(log_init_density) # type: ignore
 
@@ -127,7 +136,7 @@ class CMCD(Sampler, nn.Module):
         dt = self.eps
         for i in range(5):
             noise = self.noise_dist.sample(torch.Size((x.shape[0], x.shape[1])))
-            x = x + self.grad_log_phi(x, t) * dt + torch.sqrt(2 * dt) * noise
+            x = x + self.grad_log_pi(x, t) * dt + torch.sqrt(2 * dt) * noise
         return x
 
     def clipped_grad(self, x, t):
@@ -146,11 +155,11 @@ class CMCD(Sampler, nn.Module):
 
         return (1 - t) * grad_log_init + t * grad_log_target
 
-    def grad_log_phi_(self, x, t, stable):
+    def grad_log_pi_(self, x, t, stable):
         if stable:
             return self.clipped_grad(x, t)
         else:
-            return self.grad_log_phi(x, t)
+            return self.grad_log_pi(x, t)
 
     def _clamp_vec(self, v):
         tmp = torch.clip(v.norm(dim=1)[:, None], min=0, max=1e2)
@@ -165,15 +174,15 @@ class CMCD(Sampler, nn.Module):
         i,
         repel,
         repel_percentage,
-        precomputed_grad_phi=None,
+        precomputed_grad_pi=None,
         stable=False,
     ):
-        current_grad_phi = (
-            self.grad_log_phi_(particles, betas[i], stable)
-            if precomputed_grad_phi is None
-            else precomputed_grad_phi
+        current_grad_pi = (
+            self.grad_log_pi_(particles, betas[i], stable)
+            if precomputed_grad_pi is None
+            else precomputed_grad_pi
         )
-        drift = current_grad_phi - self.score_fn(particles, i)
+        drift = current_grad_pi - self.score_fn(particles, i)
         new_particles = particles + dt * drift + torch.sqrt(2 * dt) * noises[i]
 
         new_particles = (
@@ -183,8 +192,22 @@ class CMCD(Sampler, nn.Module):
             else new_particles
         )
 
-        next_grad_phi = self.grad_log_phi_(new_particles, betas[i + 1], stable)
-        rev_drift = next_grad_phi + self.score_fn(new_particles, i + 1)
+        return new_particles
+    
+    def evaluate_transition(
+        self,
+        particles,
+        new_particles,
+        betas,
+        dt,
+        i,
+        stable=False,
+    ):
+        current_grad_pi = self.grad_log_pi_(particles, betas[i], stable)
+        drift = current_grad_pi - self.score_fn(particles, i)
+
+        next_grad_pi = self.grad_log_pi_(new_particles, betas[i + 1], stable)
+        rev_drift = next_grad_pi + self.score_fn(new_particles, i + 1)
 
         forward_log_prob = log_normal(
             new_particles, particles + dt * drift, torch.sqrt(2 * dt)
@@ -195,25 +218,51 @@ class CMCD(Sampler, nn.Module):
 
         ln_ratio = backward_log_prob - forward_log_prob
 
-        return ln_ratio, new_particles, current_grad_phi, next_grad_phi
+        return ln_ratio, forward_log_prob
+    
+    
+    @torch.compile(mode='reduce-overhead')
+    def evaluate(self, paths: Tensor):
+        w = -self.initial_dist.log_prob(paths[0])
+        ln_ratio = []
+        ln_pi = []
+        dt = self.eps
+        betas = self.betas()
+        ln_forward = -w
 
+        for i in range(paths.shape[0] - 1):
+            ln_pi.append(self.log_pi(paths[i], betas[i]))
+            transition_ratio, ln_forward_transition = self.evaluate_transition(paths[i], paths[i+1], betas, dt, i)
+            w += transition_ratio
+            ln_forward += ln_forward_transition
+            ln_ratio.append(transition_ratio)
+
+        target_log_density = self.target_density.log_density(paths[-1])
+        ln_pi.append(target_log_density)
+        w += target_log_density
+
+        return Samples(
+            ln_rnd=w,
+            trajectory=paths,
+            ln_ratio=torch.vstack(ln_ratio),
+            ln_pi=torch.vstack(ln_pi),
+            ln_forward=ln_forward
+        )
+    
+    @torch.compile(mode='reduce-overhead')
     def evolve(self, particles: Tensor, repel: bool, repel_percentage: float):
         B = particles.shape[0]
         N = particles.shape[1]
 
-        w = -self.initial_dist.log_prob(particles)
         dt = self.eps
-
         betas = self.betas()
         noises = self.prepare_noise(N, B)
 
         trajectory = [particles]
-        ln_ratio = []
-        ln_pi = []
 
-        next_grad_phi = None
+        next_grad_pi = None
         for i in range(self.n_bridges):
-            current_ln_ratio, particles, current_grad_phi, next_grad_phi = self.step(
+            particles = self.step(
                 particles,
                 betas,
                 noises,
@@ -221,20 +270,69 @@ class CMCD(Sampler, nn.Module):
                 i,
                 repel,
                 repel_percentage,
-                next_grad_phi,
+                next_grad_pi,
             )
 
-            ln_ratio.append(current_ln_ratio)
-            ln_pi.append(current_grad_phi)
             trajectory.append(particles)
-            w += current_ln_ratio
 
-        target_log_density = self.target_density.log_density(particles)
-        ln_pi.append(target_log_density)
-        w += target_log_density
-
-        result = Samples(
-            ln_rnd=w, trajectory=trajectory, ln_ratio=ln_ratio, ln_pi=ln_pi
-        )
-
+        result = torch.stack(trajectory)
         return result
+    
+    @torch.compile(mode='reduce-overhead')
+    def sample_and_evaluate(self, batch_size: int):
+        particles = self.initial_dist.sample(batch_size)
+
+        B = particles.shape[0]
+        N = particles.shape[1]
+
+        dt = self.eps
+        betas = self.betas()
+        noises = self.prepare_noise(N, B)
+
+        w = -self.initial_dist.log_prob(particles)
+
+        def _evolve(
+            particles,
+            betas,
+            noises,
+            dt,
+            i,
+            stable=False,
+        ):
+            current_grad_pi = (
+                self.grad_log_pi_(particles, betas[i], stable)
+            )
+            drift = current_grad_pi - self.score_fn(particles, i)
+            new_particles = particles + dt * drift + torch.sqrt(2 * dt) * noises[i]
+
+            next_grad_pi = self.grad_log_pi_(new_particles, betas[i + 1], stable)
+            rev_drift = next_grad_pi + self.score_fn(new_particles, i + 1)
+            
+            forward_log_prob = log_normal(
+                new_particles, particles + dt * drift, torch.sqrt(2 * dt)
+            ).sum(-1)
+            backward_log_prob = log_normal(
+                particles, new_particles + dt * rev_drift, torch.sqrt(2 * dt)
+            ).sum(-1)
+
+            ln_ratio = backward_log_prob - forward_log_prob
+
+            return new_particles, ln_ratio
+
+        
+        for i in range(self.n_bridges):
+            particles, ln_ratio = _evolve(particles, betas, noises, dt, i)
+            w += ln_ratio
+
+        w += self.target_density.log_density(particles)
+
+
+        return Samples(
+            ln_rnd=w,
+            trajectory=torch.empty((0, )),
+            ln_ratio=torch.empty((0, )),
+            ln_pi=torch.empty((0, )),
+            ln_forward=torch.empty((0, ))
+        ) 
+        
+

@@ -3,94 +3,77 @@ from unittest import result
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import einops
+from  typing import Iterable
+from einops import rearrange
+import numpy as np
 
 Tensor = torch.Tensor
 
-class ScoreNetwork(nn.Module, ABC):
-    def __init__(self, *args, **kwargs) -> None:
-        super().__init__(*args, **kwargs)
+def check_shape(cur_shape):
+    if isinstance(cur_shape, Iterable):
+        return tuple(cur_shape)
+    elif isinstance(cur_shape, int):
+        return tuple([cur_shape,])
+    else:
+        raise NotImplementedError(f"Type {type(cur_shape)} not support")
 
-    def forward(self, x: Tensor, t: int) -> Tensor:
-        raise NotImplementedError
 
-class PositionalEncoding(nn.Module):
-    def __init__(self, max_time_steps: int, embedding_size: int, n: int = 10000) -> None:
+class FourierMLP(nn.Module):
+    def __init__(self, in_shape, out_shape, num_layers=2, channels=64,
+                 zero_init=True, res=False):
         super().__init__()
-
-        i = torch.arange(embedding_size // 2)
-        k = torch.arange(max_time_steps).unsqueeze(dim=1)
-
-        self.pos_embeddings = torch.zeros(max_time_steps, embedding_size, requires_grad=False)
-        self.pos_embeddings[:, 0::2] = torch.sin(k / (n ** (2 * i / embedding_size)))
-        self.pos_embeddings[:, 1::2] = torch.cos(k / (n ** (2 * i / embedding_size)))
-
-        self.pos_embeddings = self.pos_embeddings.cuda()
-
-        # self.linear = nn.Linear(embedding_size, embedding_size)
-
-    def forward(self, t: Tensor) -> Tensor:
-        return self.pos_embeddings[t, :]
-
-class ResNet(ScoreNetwork):
-    def __init__(
-        self, x_dim: int, t_dim: int, h_dim: int, n_bridges: int, *args, **kwargs
-    ) -> None:
-        super().__init__(*args, **kwargs)
-        self.embed_timestep = PositionalEncoding(n_bridges + 1, t_dim)
-        self.fc1 = nn.Sequential(nn.Linear(x_dim + t_dim, h_dim), nn.BatchNorm1d(h_dim), nn.Softplus())
-        self.fc2 = nn.Sequential(nn.Linear(h_dim, h_dim), nn.BatchNorm1d(h_dim), nn.Softplus())
-        self.fc3 = nn.Sequential(nn.Linear(h_dim, h_dim), nn.BatchNorm1d(h_dim), nn.Softplus())
-        self.fc4 = nn.Linear(h_dim, x_dim)
-        self.scale = nn.Parameter(torch.tensor(0.0))
-
-    def prepare_network_input(self, x: Tensor, t: int):
-        # x: [B, x_dim]
-        B = x.shape[0]
-
-        # embed timestamp
-        time_embedding = einops.repeat(self.embed_timestep(t), 'h -> b h', b=B)
-
-        # concat time embedding
-        result, _ = einops.pack([x, time_embedding], "b *")
-
-        return result
-
-    def forward(self, inputs: Tensor, t: int):
-        """
-        Input dimensions
-            inputs: [B, x_dim]
-        """
-
-        x = self.prepare_network_input(inputs, t)
         
-        x = self.fc1(x)
+        self.in_shape = check_shape(in_shape) # 2 -> (2,)
+        self.out_shape = check_shape(out_shape)
 
-        tmp = x
-        x = self.fc2(x)
-        x = tmp + x
-        
-        tmp = x
-        x = self.fc3(x)
-        x = tmp + x
-        
-        x = self.fc4(x)
+        self.register_buffer(
+            "timestep_coeff", torch.linspace(start=0.1, end=100, steps=channels)[None]
+        )
+        self.timestep_phase = nn.Parameter(torch.randn(channels)[None])
+        self.input_embed = nn.Linear(int(np.prod(in_shape)), channels)
+        self.timestep_embed = nn.Sequential(
+            nn.Linear(2 * channels, channels),
+            nn.GELU(),
+            nn.Linear(channels, channels),
+        )
+        self.layers = nn.Sequential(
+            nn.GELU(),
+            *[
+                nn.Sequential(nn.Linear(channels, channels), nn.GELU())
+                for _ in range(num_layers)
+            ],
+        )
+        self.final_layer = nn.Linear(channels, int(np.prod(self.out_shape)))
+        if zero_init:
+            self.final_layer.weight.data.fill_(0.0)
+            self.final_layer.bias.data.fill_(0.0)
 
-        return self.scale * x
+        self.residual = res
 
-    def reset_parameters(self):
-        torch.nn.init.kaiming_normal_(self.fc1[0].weight)
-        torch.nn.init.normal_(self.fc1[0].bias)
+    # cond: (1,) or (1, 1) or (bs, 1); inputs: (bs, d)
+    # output: (bs, d_out)
+    def forward(self, inputs, cond):
+        cond = torch.tensor(cond).cuda().float()
+        cond = cond.view(-1, 1).expand((inputs.shape[0], 1))
+        sin_embed_cond = torch.sin(
+            # (1, channels) * (bs, 1) + (1, channels)
+            (self.timestep_coeff * cond) + self.timestep_phase
+        )
+        cos_embed_cond = torch.cos(
+            (self.timestep_coeff * cond) + self.timestep_phase
+        )
+        embed_cond = self.timestep_embed(
+            rearrange([sin_embed_cond, cos_embed_cond], "d b w -> b (d w)")
+        ) # (bs, 2* channels) -> (bs, channels)
+        embed_ins = self.input_embed(inputs.view(inputs.shape[0], -1)) # (bs, d) -> (bs, channels)
 
-        torch.nn.init.kaiming_normal_(self.fc2[0].weight)
-        torch.nn.init.normal_(self.fc2[0].bias)
-
-        torch.nn.init.kaiming_normal_(self.fc3[0].weight)
-        torch.nn.init.normal_(self.fc3[0].bias)
-
-        torch.nn.init.kaiming_normal_(self.fc4.weight)
-        torch.nn.init.normal_(self.fc4.bias)
+        input = embed_ins + embed_cond
+        out = self.layers(input)
+        if self.residual:
+            out = out + input
+        out = self.final_layer(out) # (bs, channels) -> (bs, d)
+        return out.view(-1, *self.out_shape)
 
 def prepare_score_fn(config):
-    score_fn = ResNet(config['x_dim'], config['t_dim'], config['h_dim'], config['n_bridges'])
+    score_fn = FourierMLP(config['x_dim'], config['x_dim'])
     return score_fn

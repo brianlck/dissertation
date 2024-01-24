@@ -1,7 +1,7 @@
 from dataclasses import dataclass
 import torch    
 from torch import Tensor
-from numericals import effective_sample_size
+from cmcd.numericals import effective_sample_size
 
 @dataclass
 class Samples:
@@ -10,9 +10,10 @@ class Samples:
     """
 
     ln_rnd: Tensor  # [batch_size]
-    trajectory: list[Tensor]  # [Time, batch_size, dimension]
-    ln_ratio: list[Tensor]
-    ln_pi: list[Tensor]
+    trajectory: Tensor  # [Time, batch_size, dimension]
+    ln_ratio: Tensor
+    ln_forward: Tensor
+    ln_pi: Tensor
 
     @property
     def elbo(self):
@@ -30,7 +31,6 @@ class Samples:
 
     def jensen(self, log_norm):
         ln_rnd = self.ln_rnd + log_norm
-        device = self.ln_rnd.device
         B = ln_rnd.shape[0]
         ln_t1 = torch.vstack([ln_rnd, torch.zeros(B)]).logsumexp(dim=0)
         log_f = torch.tensor(2.0).log() - ln_t1

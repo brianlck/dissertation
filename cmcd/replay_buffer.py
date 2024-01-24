@@ -1,0 +1,45 @@
+import torch
+import numpy as np
+from cmcd.sampler import Sampler
+
+from cmcd.samples import Samples
+
+
+# Gumbel softmax by some oxford person
+def sample_without_replacement(logits: torch.Tensor, n: int) -> torch.Tensor:
+    z = torch.distributions.Gumbel(torch.tensor(0.0), torch.tensor(1.0)).sample(logits.shape)
+    topk = torch.topk(z + logits, n, sorted=False)
+    indices = topk.indices
+    indices = indices[torch.randperm(n).to(indices.device)]
+    return indices
+
+class ReplayBuffer:
+    def __init__(self, traj_len, dim, capacity):
+        self.capacity = capacity
+        self.prio = torch.zeros((capacity,))
+        self.paths = torch.zeros((capacity, traj_len, dim))
+        self.size = 0
+
+    def __len__(self):
+        return min(self.capacity, self.size)
+
+    def calculate_priority(self, sampler: Sampler, samples: Samples):
+        return (samples.ln_rnd - sampler.ln_z).pow(2).mean()
+
+    @torch.no_grad()
+    def add(self, sampler, samples, indicies):
+        priority, paths = self.calculate_priority(sampler, samples).detach(), samples.trajectory.swapaxes(0, 1).detach()
+        if indicies is not None:
+            self.prio[indicies] = priority[:len(indicies)]
+            priority = priority[len(indicies):]
+            paths = paths[len(indicies):]
+        self.size += len(priority)
+        
+        insert_position = torch.arange(self.size, self.size + len(priority)) % self.capacity
+        self.prio[insert_position] = priority
+        self.paths[insert_position] = paths
+
+    def sample(self, batch_size):
+        selected_id = sample_without_replacement(self.prio[: min(self.capacity, self.size)], batch_size)
+        paths = self.paths[selected_id].swapaxes(0, 1)
+        return selected_id, paths
