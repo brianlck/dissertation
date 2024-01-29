@@ -37,6 +37,7 @@ class Funnel(LogDensity):
     def __init__(self) -> None:
         super().__init__()
 
+    @torch.compiler.allow_in_graph
     def log_density(self, x: Tensor):  # x: [B x 10]
         def const(f):
             return torch.tensor(f, device=x.device)
@@ -96,6 +97,7 @@ class GaussianMixture(LogDensity):
 
         return torch.stack([logp1, logp2, logp3])
     
+    @torch.compiler.allow_in_graph
     def log_density(self, x):
         logp1 = self.asymmetric_density(x)
         logp2 = self.asymmetric_density(torch.flip(x, dims=[-1]))
@@ -183,6 +185,7 @@ class GMM(nn.Module, LogDensity):
     def test_set(self) -> torch.Tensor:
         return self.sample((self.n_test_set_samples, ))
 
+    @torch.compiler.allow_in_graph
     def log_density(self, x: torch.Tensor):
         log_prob = self.distribution.log_prob(x)
         # Very low probability samples can cause issues (we turn off validate_args of the

@@ -24,21 +24,24 @@ class ReplayBuffer:
         return min(self.capacity, self.size)
 
     def calculate_priority(self, sampler: Sampler, samples: Samples):
-        return (samples.ln_rnd - sampler.ln_z).pow(2).mean()
+        return samples.ln_rnd
 
     @torch.no_grad()
+    @torch.compiler.allow_in_graph
     def add(self, sampler, samples, indicies):
         priority, paths = self.calculate_priority(sampler, samples).detach(), samples.trajectory.swapaxes(0, 1).detach()
         if indicies is not None:
-            self.prio[indicies] = priority[:len(indicies)]
-            priority = priority[len(indicies):]
-            paths = paths[len(indicies):]
-        self.size += len(priority)
+            self.prio[indicies] = priority[:indicies.shape[0]]
+            priority = priority[indicies.shape[0]:]
+            paths = paths[indicies.shape[0]:]
+        self.size += priority.shape[0]
         
         insert_position = torch.arange(self.size, self.size + len(priority)) % self.capacity
         self.prio[insert_position] = priority
         self.paths[insert_position] = paths
 
+    @torch.no_grad()
+    @torch.compiler.allow_in_graph
     def sample(self, batch_size):
         selected_id = sample_without_replacement(self.prio[: min(self.capacity, self.size)], batch_size)
         paths = self.paths[selected_id].swapaxes(0, 1)

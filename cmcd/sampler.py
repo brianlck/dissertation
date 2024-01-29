@@ -10,6 +10,8 @@ from cmcd.score import FourierMLP
 
 Tensor = torch.Tensor
 
+torch._dynamo.config.capture_func_transforms=True
+
 class Sampler(nn.Module, ABC):
     def __init__(
         self, initial_dist, target_density, *args, **kwargs
@@ -61,7 +63,7 @@ class CMCD(Sampler, nn.Module):
             self.register_buffer("eps", eps)
 
         self.grid_t = nn.Parameter(torch.zeros(n_bridges))
-        self.ln_z = nn.Parameter(torch.tensor(0.0))
+        self.ln_z = nn.Parameter(torch.zeros(n_bridges))
 
         noise_loc = torch.tensor(0.0)
         noise_scale = torch.tensor(1.0)
@@ -108,29 +110,26 @@ class CMCD(Sampler, nn.Module):
 
         return self.anneal(log_initial, log_target, t)
 
-    def get_grad(f):
-        @torch._dynamo.allow_in_graph
-        def _inner(self, x, t):
-            return torch.func.grad(lambda x, t: f(self, x, t).sum())(x, t) # type: ignore
-
-        return lambda self, x, t: _inner(self, x, t)
-
-    def get_grad2(f):
-        @torch._dynamo.allow_in_graph
-        def _inner(self, x):
-            return torch.func.grad(lambda x: f(self, x).sum())(x) # type: ignore
-
-        return lambda self, x: _inner(self, x)
-
     def log_init_density(self, x):
         return self.initial_dist.log_prob(x)
 
     def log_target_density(self, x):
         return self.target_density.log_density(x)
 
-    grad_log_pi = get_grad(log_pi)  # type: ignore
-    grad_target_log = get_grad2(log_target_density) # type: ignore
-    grad_initial_log = get_grad2(log_init_density) # type: ignore
+    def _inner(self, x, t):
+        return self.log_pi(x, t).sum()
+    
+    @torch.compiler.allow_in_graph
+    def grad_log_pi(self, x, t):
+        return torch.func.grad(self._inner)(x, t)
+    
+    def get_grad(f):
+        def _inner(self, x):
+            return torch.func.grad(lambda x: f(self, x).sum())(x) # type: ignore
+        return lambda self, x: _inner(self, x)
+
+    grad_target_log = torch.compiler.allow_in_graph(get_grad(log_target_density)) # type: ignore
+    grad_initial_log = torch.compiler.allow_in_graph(get_grad(log_init_density)) # type: ignore
 
     def correct(self, x, t):
         dt = self.eps
@@ -155,6 +154,7 @@ class CMCD(Sampler, nn.Module):
 
         return (1 - t) * grad_log_init + t * grad_log_target
 
+    @torch.compiler.allow_in_graph
     def grad_log_pi_(self, x, t, stable):
         if stable:
             return self.clipped_grad(x, t)
@@ -221,7 +221,7 @@ class CMCD(Sampler, nn.Module):
         return ln_ratio, forward_log_prob
     
     
-    @torch.compile(mode='reduce-overhead')
+    # @torch.compile(mode='default')
     def evaluate(self, paths: Tensor):
         w = -self.initial_dist.log_prob(paths[0])
         ln_ratio = []
@@ -249,7 +249,7 @@ class CMCD(Sampler, nn.Module):
             ln_forward=ln_forward
         )
     
-    @torch.compile(mode='reduce-overhead')
+    # @torch.compile(mode='default')
     def evolve(self, particles: Tensor, repel: bool, repel_percentage: float):
         B = particles.shape[0]
         N = particles.shape[1]
@@ -278,7 +278,8 @@ class CMCD(Sampler, nn.Module):
         result = torch.stack(trajectory)
         return result
     
-    @torch.compile(mode='reduce-overhead')
+    
+    @torch.compile(mode='max-autotune')
     def sample_and_evaluate(self, batch_size: int):
         particles = self.initial_dist.sample(batch_size)
 
