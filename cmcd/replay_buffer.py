@@ -1,3 +1,4 @@
+from git import Optional
 import torch
 import numpy as np
 from cmcd.sampler import Sampler
@@ -23,11 +24,13 @@ class ReplayBuffer:
     def __len__(self):
         return min(self.capacity, self.size)
 
-    def calculate_priority(self, sampler: Sampler, samples: Samples):
-        return (samples.ln_rnd - sampler.ln_z).pow(2).mean()
 
     @torch.no_grad()
-    def add(self, sampler, samples, indicies):
+    def calculate_priority(self, sampler: Sampler, samples: Samples):
+        return samples.ln_rnd
+
+    @torch.no_grad()
+    def add(self, sampler, samples, indicies: Optional[torch.Tensor] = None):
         priority, paths = self.calculate_priority(sampler, samples).detach(), samples.trajectory.swapaxes(0, 1).detach()
         if indicies is not None:
             self.prio[indicies] = priority[:len(indicies)]
@@ -39,7 +42,10 @@ class ReplayBuffer:
         self.prio[insert_position] = priority
         self.paths[insert_position] = paths
 
-    def sample(self, batch_size):
-        selected_id = sample_without_replacement(self.prio[: min(self.capacity, self.size)], batch_size)
+        
+    @torch.no_grad()
+    def sample(self, batch_size, uniform=True):
+        priority = self.prio[: min(self.capacity, self.size)] 
+        selected_id = sample_without_replacement(priority, batch_size)
         paths = self.paths[selected_id].swapaxes(0, 1)
         return selected_id, paths

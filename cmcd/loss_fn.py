@@ -35,7 +35,29 @@ class LogVarianceLoss(LossFunction):
         if self.detach:
             samples.trajectory = samples.trajectory.detach()
 
+        
         return samples.ln_rnd.var()
+        # return ((samples.ln_rnd - samples.ln_z) ** 2).mean()
+
+
+class ImprovedLogVarianceLoss(LossFunction):
+    def __init__(self, detach=True):
+        super().__init__()
+        self.detach = detach
+
+    def evaluate(self, sampler: Sampler, samples: Samples):
+        if self.detach:
+            samples.trajectory = samples.trajectory.detach()
+
+        return ((samples.ln_rnd - samples.ln_z) ** 2).mean()
+class ImprovedTrajectoryBalance(LossFunction):
+    def __init__(self, detach=True):
+        super().__init__()
+        self.detach = detach
+
+    def evaluate(self, sampler: CMCD, samples: Samples):
+
+        return ((samples.ln_rnd - sampler.ln_z_base) ** 2).mean()
 
 
 class SubtrajLogVar(LossFunction):
@@ -86,7 +108,7 @@ def cal_subtb_coef_matrix(lamda, N):
 
     self.coef[i, j] = lamda^(j-i) / total_lambda  if i < j else 0.
     """
-    range_vals = torch.arange(N + 1)
+    range_vals = torch.arange(0, N + 1)
     diff_matrix = range_vals - range_vals.view(-1, 1)
     B = np.log(lamda) * diff_matrix
     B[diff_matrix <= 0] = -np.inf
@@ -106,8 +128,7 @@ class SubtrajectoryBalance(LossFunction):
             samples.trajectory = samples.trajectory.detach()
 
         ln_ratio = torch.vstack([torch.zeros(1, samples.ln_ratio.shape[1]), -samples.ln_ratio.cumsum(dim=0)])
-        betas = sampler.betas()
-        ln_pi = samples.ln_pi + (betas * sampler.ln_z).view(-1, 1)
+        ln_pi = samples.ln_pi + sampler.ln_z.view(-1, 1)
         ln_pi = torch.swapaxes(ln_pi, 0, 1)
         ln_ratio = ln_ratio.swapaxes(0, 1)
 
@@ -121,17 +142,35 @@ class SubtrajectoryBalance(LossFunction):
 
         return loss
 
+class ScoreMatching(LossFunction):
+    def __init__(self, detach=True):
+        super().__init__()
+        self.detach = detach
+
+    def evaluate(self, sampler: Sampler, samples: Samples):
+        if self.detach:
+            samples.trajectory = samples.trajectory.detach()
+
+        # print(samples.trajectory)
+        # print(samples.score.pow(2))
+        return samples.score.pow(2).sum(dim=-1).mean(dim=-1).mean()
 
 def prepare_loss_fn(config: dict):
     loss_fn = config["loss_fn"]
     if loss_fn == "reverse-kl":
         return ReverseKL()
+    elif loss_fn == "score-matching":
+        return ScoreMatching()
     elif loss_fn == "log-var":
         return LogVarianceLoss()
+    elif loss_fn == "improved-log-var":
+        return ImprovedLogVarianceLoss()
     elif loss_fn == "subtraj-log-var":
         return SubtrajLogVar()
     elif loss_fn == "traj-balance":
         return TrajectoryBalance()
+    elif loss_fn == "improved-traj-balance":
+        return ImprovedTrajectoryBalance()
     elif loss_fn == "subtraj-balance":
         return SubtrajectoryBalance(config["n_bridges"])
     else:
@@ -146,7 +185,8 @@ if __name__ == '__main__':
         ln_pi=torch.tensor([[0.3, 0.4, 0.6], [0.1, 0.9, 0.4]]).T,
         ln_ratio=torch.tensor([[0.3, 0.4], [0.9, 0.4]]).T,
         trajectory=torch.empty((0,)),
-        ln_forward=torch.empty((0,))
+        ln_forward=torch.empty((0,)),
+        score=None
     )    
 
     sampler = dict(

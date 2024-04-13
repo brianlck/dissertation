@@ -1,4 +1,5 @@
 from dataclasses import dataclass
+from typing import Optional
 import torch    
 from torch import Tensor
 from cmcd.numericals import effective_sample_size
@@ -14,6 +15,7 @@ class Samples:
     ln_ratio: Tensor
     ln_forward: Tensor
     ln_pi: Tensor
+    score: Optional[Tensor]
 
     @property
     def elbo(self):

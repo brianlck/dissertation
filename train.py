@@ -38,7 +38,7 @@ def train(
 ):
     all_losses = []
 
-    buffer = ReplayBuffer(config["n_bridges"] + 1, config["x_dim"], 20 * config["batch_size"])
+    buffer = ReplayBuffer(config["n_bridges"] + 1, config["x_dim"], 10 * config["batch_size"])
 
     try:
         with Progress(
@@ -75,26 +75,34 @@ def train(
                 samples = None
                 indicies = None
 
-                if config["loss_fn"] == "reverse-kl":
+                if not config["use_buffer"]:
                     samples = sampler.sample_and_evaluate(batch_size)
+                    ln_z = samples.ln_z.detach().item()
+                    elbo = samples.elbo.detach().item()
                 else:
-                    if config["use_buffer"] and len(buffer) >= batch_size // 2:
-                        indicies, paths1 = buffer.sample(batch_size // 2)
-                        paths2 = sampler.sample(batch_size // 2, repel=repel, repel_percentage=repel_ratio)
-                        paths = torch.concat([paths1, paths2], dim=1)
+                    if len(buffer) >= batch_size // 2:
+                        paths = sampler.sample_and_evaluate(batch_size // 2)
+                        ln_z = paths.ln_z.detach().item()
+                        elbo = paths.elbo.detach().item()
+                        indicies, buffer_paths = buffer.sample(batch_size // 2)
+                        paths = torch.concat([buffer_paths, paths.trajectory], dim=1)
                     else:
-                        paths = sampler.sample(
+                        paths = sampler.sample_and_evaluate(
                             batch_size, repel=repel, repel_percentage=config["repel_percentage"]
                         )
+                        ln_z = paths.ln_z.detach().item()
+                        elbo = paths.elbo.detach().item()
+                        paths = paths.trajectory
+
                     paths = paths.detach()
-                    samples = sampler.evaluate(paths)
+                    samples = sampler.evaluate(paths, calc_score=True)
+                    if config["use_buffer"]:
+                        buffer.add(sampler, samples, indicies)
                 
                 loss = loss_fn.evaluate(sampler, samples)
                 loss.backward()
-
-                if config["use_buffer"]:
-                    buffer.add(sampler, samples, indicies)
                 
+                # torch.nn.utils.clip_grad_norm_(sampler.parameters(), 1)
 
                 optim.step()
                 scheduler.step()
@@ -102,8 +110,6 @@ def train(
                 loss = loss.detach().item()
                 all_losses.append(loss)
 
-                ln_z = samples.ln_z.detach().item()
-                elbo = samples.elbo.detach().item()
                 eps = sampler.eps.item()
 
                 wandb.log(

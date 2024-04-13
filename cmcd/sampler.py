@@ -4,16 +4,15 @@ import torch
 import torch.nn as nn
 from torch.distributions import Normal
 from cmcd.anneal import AnnealingSchedule
-from cmcd.densities import  log_normal
+from cmcd.densities import log_normal
 from cmcd.samples import Samples
 from cmcd.score import FourierMLP
 
 Tensor = torch.Tensor
 
+
 class Sampler(nn.Module, ABC):
-    def __init__(
-        self, initial_dist, target_density, *args, **kwargs
-    ) -> None:
+    def __init__(self, initial_dist, target_density, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)
         self.initial_dist = initial_dist
         self.target_density = target_density
@@ -23,15 +22,15 @@ class Sampler(nn.Module, ABC):
         raise NotImplementedError
 
     @abstractmethod
-    def evaluate(self, paths: Tensor) -> Samples:
+    def evaluate(self, paths: Tensor, **kwargs) -> Samples:
         raise NotImplementedError
 
     def sample(self, batch, **kwargs) -> Tensor:
         particles = self.initial_dist.sample(batch)
         return self.evolve(particles, **kwargs)
-    
+
     @abstractmethod
-    def sample_and_evaluate(self, batch) -> Samples:
+    def sample_and_evaluate(self, batch, **kwargs) -> Samples:
         raise NotImplementedError
 
 
@@ -72,6 +71,12 @@ class CMCD(Sampler, nn.Module):
             validate_args=False,
         )
 
+
+        self.ln_z_base = torch.tensor(0.0)
+
+    def update_ln_z_base(self, ln_z):
+        self.ln_z_base = ln_z
+
     def repel(self, x, t, a):
         batch = int(x.shape[0] * a)
         repel_x = x[:batch]
@@ -111,14 +116,14 @@ class CMCD(Sampler, nn.Module):
     def get_grad(f):
         @torch._dynamo.allow_in_graph
         def _inner(self, x, t):
-            return torch.func.grad(lambda x, t: f(self, x, t).sum())(x, t) # type: ignore
+            return torch.func.grad(lambda x, t: f(self, x, t).sum())(x, t)  # type: ignore
 
         return lambda self, x, t: _inner(self, x, t)
 
     def get_grad2(f):
         @torch._dynamo.allow_in_graph
         def _inner(self, x):
-            return torch.func.grad(lambda x: f(self, x).sum())(x) # type: ignore
+            return torch.func.grad(lambda x: f(self, x).sum())(x)  # type: ignore
 
         return lambda self, x: _inner(self, x)
 
@@ -129,8 +134,8 @@ class CMCD(Sampler, nn.Module):
         return self.target_density.log_density(x)
 
     grad_log_pi = get_grad(log_pi)  # type: ignore
-    grad_target_log = get_grad2(log_target_density) # type: ignore
-    grad_initial_log = get_grad2(log_init_density) # type: ignore
+    grad_target_log = get_grad2(log_target_density)  # type: ignore
+    grad_initial_log = get_grad2(log_init_density)  # type: ignore
 
     def correct(self, x, t):
         dt = self.eps
@@ -193,7 +198,7 @@ class CMCD(Sampler, nn.Module):
         )
 
         return new_particles
-    
+
     def evaluate_transition(
         self,
         particles,
@@ -219,37 +224,56 @@ class CMCD(Sampler, nn.Module):
         ln_ratio = backward_log_prob - forward_log_prob
 
         return ln_ratio, forward_log_prob
-    
-    
-    @torch.compile(mode='reduce-overhead')
-    def evaluate(self, paths: Tensor):
-        w = -self.initial_dist.log_prob(paths[0])
+
+    # @torch.compile(mode='reduce-overhead')
+    def evaluate(self, paths: Tensor, calc_score=False):
+        paths = paths.swapaxes(0, 1)
+        paths.requires_grad = True
+
+        w = -self.initial_dist.log_prob(paths[:, 0])
         ln_ratio = []
         ln_pi = []
         dt = self.eps
         betas = self.betas()
         ln_forward = -w
 
-        for i in range(paths.shape[0] - 1):
-            ln_pi.append(self.log_pi(paths[i], betas[i]))
-            transition_ratio, ln_forward_transition = self.evaluate_transition(paths[i], paths[i+1], betas, dt, i)
+        for i in range(paths.shape[1] - 1):
+            ln_pi.append(self.log_pi(paths[:, i], betas[i]))
+            transition_ratio, ln_forward_transition = self.evaluate_transition(
+                paths[:, i], paths[:, i + 1], betas, dt, i
+            )
             w += transition_ratio
             ln_forward += ln_forward_transition
             ln_ratio.append(transition_ratio)
 
-        target_log_density = self.target_density.log_density(paths[-1])
+            
+
+        target_log_density = self.target_density.log_density(paths[:, -1])
         ln_pi.append(target_log_density)
         w += target_log_density
 
+
+        score = (
+            torch.autograd.grad(
+                outputs=w,
+                inputs=paths,
+                grad_outputs=torch.ones_like(w),
+                create_graph=True
+            )[0]
+            if calc_score
+            else None
+        )
+
         return Samples(
             ln_rnd=w,
-            trajectory=paths,
+            trajectory=paths.swapaxes(0, 1),
             ln_ratio=torch.vstack(ln_ratio),
             ln_pi=torch.vstack(ln_pi),
-            ln_forward=ln_forward
+            ln_forward=ln_forward,
+            score=score,
         )
-    
-    @torch.compile(mode='reduce-overhead')
+
+    # @torch.compile(mode='reduce-overhead')
     def evolve(self, particles: Tensor, repel: bool, repel_percentage: float):
         B = particles.shape[0]
         N = particles.shape[1]
@@ -277,10 +301,13 @@ class CMCD(Sampler, nn.Module):
 
         result = torch.stack(trajectory)
         return result
-    
-    @torch.compile(mode='reduce-overhead')
-    def sample_and_evaluate(self, batch_size: int):
+
+    # @torch.compile(mode="reduce-overhead")
+    def sample_and_evaluate(self, batch_size: int, detach: bool = True):
         particles = self.initial_dist.sample(batch_size)
+        if detach:
+            particles = particles.detach()
+        trajectory = [particles]
 
         B = particles.shape[0]
         N = particles.shape[1]
@@ -299,15 +326,17 @@ class CMCD(Sampler, nn.Module):
             i,
             stable=False,
         ):
-            current_grad_pi = (
-                self.grad_log_pi_(particles, betas[i], stable)
-            )
+            if detach:
+                particles = particles.detach()
+            current_grad_pi = self.grad_log_pi_(particles, betas[i], stable)
             drift = current_grad_pi - self.score_fn(particles, i)
             new_particles = particles + dt * drift + torch.sqrt(2 * dt) * noises[i]
+            if detach:
+                new_particles = new_particles.detach()
 
             next_grad_pi = self.grad_log_pi_(new_particles, betas[i + 1], stable)
             rev_drift = next_grad_pi + self.score_fn(new_particles, i + 1)
-            
+
             forward_log_prob = log_normal(
                 new_particles, particles + dt * drift, torch.sqrt(2 * dt)
             ).sum(-1)
@@ -319,20 +348,20 @@ class CMCD(Sampler, nn.Module):
 
             return new_particles, ln_ratio
 
-        
         for i in range(self.n_bridges):
             particles, ln_ratio = _evolve(particles, betas, noises, dt, i)
             w += ln_ratio
+            trajectory.append(particles)
+
 
         w += self.target_density.log_density(particles)
 
-
+        trajectory = torch.stack(trajectory)
         return Samples(
             ln_rnd=w,
-            trajectory=torch.empty((0, )),
-            ln_ratio=torch.empty((0, )),
-            ln_pi=torch.empty((0, )),
-            ln_forward=torch.empty((0, ))
-        ) 
-        
-
+            trajectory=trajectory,
+            ln_ratio=torch.empty((0,)),
+            ln_pi=torch.empty((0,)),
+            ln_forward=torch.empty((0,)),
+            score=None,
+        )
