@@ -28,10 +28,8 @@ class ReplayBuffer:
     @torch.no_grad()
     def calculate_priority(self, sampler: Sampler, samples: Samples):
         return samples.ln_rnd
-        return samples.ln_rnd
 
     @torch.no_grad()
-    @torch.compiler.allow_in_graph
     def add(self, sampler, samples, indicies: Optional[torch.Tensor] = None):
         priority, paths = self.calculate_priority(sampler, samples).detach(), samples.trajectory.swapaxes(0, 1).detach()
         if indicies is not None:
