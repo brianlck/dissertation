@@ -96,7 +96,7 @@ class TrajectoryBalance(LossFunction):
         if self.detach:
             samples.trajectory = samples.trajectory.detach()
 
-        return (samples.ln_rnd - sampler.ln_z).pow(2).mean()
+        return (samples.ln_rnd - sampler.ln_z[-1]).pow(2).mean()
 
 
 def cal_subtb_coef_matrix(lamda, N):
@@ -129,6 +129,8 @@ class SubtrajectoryBalance(LossFunction):
 
         ln_ratio = torch.vstack([torch.zeros(1, samples.ln_ratio.shape[1]), -samples.ln_ratio.cumsum(dim=0)])
         ln_pi = samples.ln_pi + sampler.ln_z.view(-1, 1)
+        betas = sampler.betas()
+        ln_pi = samples.ln_pi + torch.concat([torch.zeros((1,)), sampler.ln_z])
         ln_pi = torch.swapaxes(ln_pi, 0, 1)
         ln_ratio = ln_ratio.swapaxes(0, 1)
 

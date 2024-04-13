@@ -60,7 +60,7 @@ class CMCD(Sampler, nn.Module):
             self.register_buffer("eps", eps)
 
         self.grid_t = nn.Parameter(torch.zeros(n_bridges))
-        self.ln_z = nn.Parameter(torch.tensor(0.0))
+        self.ln_z = nn.Parameter(torch.zeros(n_bridges))
 
         noise_loc = torch.tensor(0.0)
         noise_scale = torch.tensor(1.0)
@@ -160,6 +160,7 @@ class CMCD(Sampler, nn.Module):
 
         return (1 - t) * grad_log_init + t * grad_log_target
 
+    @torch.compiler.allow_in_graph
     def grad_log_pi_(self, x, t, stable):
         if stable:
             return self.clipped_grad(x, t)
